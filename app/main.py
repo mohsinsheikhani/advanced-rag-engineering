@@ -1,0 +1,36 @@
+"""FastAPI entry point with CORS, lifespan, and request/response schemas."""
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+import redis.asyncio as redis
+
+from app.document_store import get_document_store
+from app.config import settings
+
+# Global state
+app_state = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Initialize Haystack document store and Redis
+    app_state["document_store"] = get_document_store()
+    app_state["redis"] = await redis.from_url(f"redis://{settings.redis_host}:{settings.redis_port}")
+    
+    yield
+    
+    # Shutdown: Cleanup resources
+    await app_state["redis"].close()
+
+app = FastAPI(title="Production RAG System", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "production-rag-system", "framework": "haystack"}
