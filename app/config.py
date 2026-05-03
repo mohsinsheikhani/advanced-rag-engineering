@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     # LLM
     llm_model: str = "gpt-4"
     llm_temperature: float = 0.0
+    openai_api_key: str = ""
     
     # Vector DB
     qdrant_host: str = "localhost"

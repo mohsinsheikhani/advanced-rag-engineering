@@ -1,33 +1,25 @@
-"""Script to index markdown documents into Qdrant."""
-import sys
+"""Index all markdown documents into Qdrant."""
+import sys, os
 from pathlib import Path
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 from app.document_store import get_document_store
 from pipeline.ingest import IngestionPipeline
 
-def main():
-    # Initialize
-    document_store = get_document_store()
-    pipeline = IngestionPipeline(document_store)
-    
-    # Get first markdown file to test
-    docs_dir = Path(__file__).parent.parent / "knowledge-base"
-    md_files = list(docs_dir.rglob("*.md"))
-    
-    if md_files:
-        print(f"Testing with: {md_files[0]}")
-        result = pipeline.ingest(str(md_files[0]))
-        
-        # Print converted documents (with markdown preserved)
-        print("\n=== CONVERTED DOCUMENTS ===")
-        for doc in result.get("converter", {}).get("documents", []):
-            print(f"\nFull Content:\n{doc.content}")
-            print(f"\nMetadata: {doc.meta}")
-    else:
-        print("No markdown files found")
+document_store = get_document_store()
+pipeline = IngestionPipeline(document_store)
 
-if __name__ == "__main__":
-    main()
+docs_dir = Path(__file__).parent.parent / "knowledge_base"
+md_files = list(docs_dir.rglob("*.md"))
+print(f"Found {len(md_files)} files")
+
+for f in md_files:
+    result = pipeline.ingest(str(f))
+    written = result.get("writer", {}).get("documents_written", "?")
+    print(f"  {f.name}: {written} chunks written")
+
+print("\nDone.")
