@@ -30,6 +30,9 @@ data/
 *.log
 logs/
 
+# DeepEval cache / telemetry
+.deepeval/
+
 # UV
 .uv/
 

@@ -126,3 +126,58 @@ The most specific chunk (`## 4. Who This Is For` from `what-is-mia.md`) ranks at
 - **Embedding**: SentenceTransformersDocumentEmbedder
 - **Retrieval**: QdrantEmbeddingRetriever, InMemoryBM25Retriever, DocumentJoiner
 - **Generation**: OpenAIGenerator with PromptBuilder
+
+---
+
+### Evaluation — Diagnostic Framework
+
+**Decision:** Run the four standard RAG metrics (Faithfulness, Contextual Precision, Contextual Recall, Answer Relevancy) on a small golden set, then deliberately break individual pipeline components and observe which metrics react. The point isn't the absolute scores — it's building the intuition for *which metric flags which failure mode*.
+
+**What each metric actually measures (and what it doesn't):**
+
+| Metric | What it computes | What it does NOT detect |
+|---|---|---|
+| **Faithfulness** | Decomposes the *answer* into atomic claims; for each claim, asks the judge LLM whether retrieved context supports it. Score = supported claims / total claims. | Whether the retrieved context is *correct*. A confidently wrong answer grounded in a wrong-but-retrieved chunk scores 1.00. |
+| **Contextual Precision** | For each retrieved chunk, asks "is this relevant to the input?" Weighted by rank (top positions matter more). Reflects reranker quality. | Whether the *right* chunks were retrieved at all (that's recall). |
+| **Contextual Recall** | Decomposes the *ground-truth answer* into claims; checks each against retrieved chunks. Score = attributable claims / total claims. **Requires `expected_output`.** | Anything about the generated answer — purely a retrieval-side metric. |
+| **Answer Relevancy** | Generates N hypothetical questions the answer *could* be answering; measures cosine similarity to the original input. | Whether the answer is *correct* — only whether it's *on-topic* for the question. |
+
+**Failure-mode experiment (Config B2: bad embedder, row 1 of synthetic testset):**
+
+Query: *"What Mia can help with?"*  Reference: §9 of `book-ordering-process.md`.
+
+| Config | Change | Faithfulness | Ctx Precision | Ctx Recall | Answer Relevancy |
+|---|---|---|---|---|---|
+| Baseline | `text-embedding-3-small` + `gpt-4o-mini` + neutral prompt | 1.00 | 1.00 | 1.00 | 1.00 |
+| B2 — bad embedder | swap embedder → `multi-qa-MiniLM-L6-cos-v1` (384-D) | **1.00** | 0.95 | **0.00** | **1.00** |
+| D — bad generator | swap LLM → `gpt-3.5-turbo` + "be creative, fill gaps" prompt | 1.00 | 1.00 | 1.00 | **0.88** |
+
+**The dangerous result:** Faithfulness and Answer Relevancy both stayed at 1.00 *while the retriever was completely failing*. Recall went to 0.00 — the gold chunk was not in top-5; the small model surfaced lexically-adjacent chunks ("explaining processes", "routing to support") from unrelated docs instead.
+
+**Why this matters:** Faithfulness can't catch retriever failures because it only checks answer-vs-context consistency, not context-vs-truth. Answer Relevancy can't catch them either because it only measures topical alignment, not correctness. **Contextual Recall is the only one of the four that requires ground truth, and therefore the only one that flags this failure mode.**
+
+**Operational takeaway:** Production RAG eval needs a golden set with ground-truth answers — not just LLM-as-judge on free-form output. Without recall, a system can score 1.00 on three metrics and still be silently wrong.
+
+**Why Config D didn't break Faithfulness (the failed-prediction lesson):**
+
+The prediction was: weaker LLM + a "be creative, fill gaps" prompt should drop Faithfulness via hallucination. It didn't. Faithfulness stayed at 1.00.
+
+Reason: Faithfulness only drops when the model makes claims **not in the retrieved context**. Row 1's gold chunk (§9 of `book-ordering-process.md`) was retrieved cleanly and contains a complete answer to "What Mia can help with?" — so even with `gpt-3.5-turbo` and an aggressive creative-license prompt, the model had **no gap to fill**. It paraphrased the chunk instead of inventing.
+
+The only signal of generator degradation was a **0.88 Answer Relevancy** (vs 1.00 baseline) — likely from creative padding pulling the answer slightly off-topic for the input. Faithfulness is thus a *necessary but not sufficient* check on the generator: it can only flag hallucination when retrieval has left room for it.
+
+**Methodological consequence:** to stress-test the generator in isolation, pair the bad-generator config with a query whose gold chunk is **partial** or **missing** from retrieval — then the model is forced to either say "I don't know" or hallucinate, and Faithfulness becomes diagnostic again.
+
+**Faithfulness — additional behaviors worth knowing:**
+
+- **Weak model, good chunks → Faithfulness can drop while retrieval is fine.** A weaker LLM may ignore or paraphrase past the relevant chunk, producing claims that aren't grounded even though the right context was retrieved. Precision/Recall will look healthy; Faithfulness alone reflects the generator weakness.
+- **Strong model, bad prompt → Faithfulness can still drop.** A capable model with a poorly-written prompt (e.g. one that encourages generalization, summarization, or tone-shifting) may emit claims that don't match the retrieved chunks. The retriever isn't at fault; the prompt is.
+- **A faithful answer is not always a correct answer; an unfaithful answer is not always a wrong one.** Faithfulness only checks consistency between answer and retrieved context. An answer that doesn't match the retrieved chunks may still be correct (e.g. it draws on the model's parametric knowledge to address the query). In that case, Faithfulness drops but the system actually behaved well — and conversely, a perfectly faithful answer can still be wrong if the chunks themselves were wrong. **Faithfulness is a consistency check, not a correctness check, in either direction.**
+
+**Third gap in the four-metric framework (Config D' finding):**
+
+| Gap | Symptom | What to add |
+|---|---|---|
+| Faithfulness can't catch retriever failure | Faithfulness 1.00 while answer is silently wrong | Contextual Recall (needs ground truth) |
+| Faithfulness can't catch generator drift when retrieval covers the answer | Faithfulness 1.00; only Answer Relevancy wobbles | Direct correctness metric (e.g. `GEval` answer-vs-expected) |
+| Recall can't evaluate "answer should be 'I don't know'" cases | Recall 0.00 even when the system correctly refuses | Refusal/abstention check (assert the answer contains a hedge or "not specified" phrase) |

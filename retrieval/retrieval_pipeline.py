@@ -8,7 +8,7 @@ from haystack_integrations.document_stores.qdrant import QdrantDocumentStore
 def create_retrieval_pipeline(document_store: QdrantDocumentStore) -> Pipeline:
     pipeline = Pipeline()
     pipeline.add_component("text_embedder", OpenAITextEmbedder(model="text-embedding-3-small"))
-    pipeline.add_component("retriever", QdrantEmbeddingRetriever(document_store=document_store, top_k=5))
+    pipeline.add_component("retriever", QdrantEmbeddingRetriever(document_store=document_store, top_k=3))
 
     pipeline.connect("text_embedder.embedding", "retriever.query_embedding")
 
