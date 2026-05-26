@@ -42,3 +42,6 @@ Thumbs.db
 
 # docs
 knowledge_base/
+
+# Bench artifacts (regenerated per run)
+scripts/bench_results*.csv
