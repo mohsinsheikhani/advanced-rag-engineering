@@ -1,53 +1,155 @@
 # Production RAG System
 
-A production-ready RAG system built with **Haystack**, featuring CRAG, semantic caching, and hybrid retrieval.
+A working RAG backend that I used as a sandbox to think through, measure, and write down the decisions that actually matter in production. The chat path is small on purpose. Most of the work lives in the engineering decisions section below, where each choice is backed by numbers, tradeoffs, and a short note on what I'd change next.
 
-## Architecture
+If you're a recruiter, hiring manager, or founder evaluating me, the fastest read is the [Headline results](#headline-results) and then any one of the [engineering decision sections](#engineering-decisions). Each section is self-contained.
 
-- **Framework**: Haystack for document processing and retrieval
-- **Runtime**: FastAPI backend with SSE streaming
-- **Data Pipeline**: Haystack indexing pipeline (offline)
-- **Infrastructure**: Qdrant (vector DB), Redis (semantic cache)
+**Tech:** Python, FastAPI, Haystack, Qdrant, Redis Stack, OpenAI (`text-embedding-3-small`, `gpt-4o-mini`), Langfuse, DeepEval, SSE streaming, semantic caching, RAG evaluation, observability, Docker.
 
-## Features
+**Contact:** [linkedin.com/in/mohsin-sheikhani](https://www.linkedin.com/in/mohsin-sheikhani/)
 
-- **Haystack Pipelines**: Built-in document processing, embedding, and retrieval
-- **CRAG**: Self-correcting RAG with citations
-- **Semantic Cache**: Redis HNSW for query caching
-- **Hybrid Retrieval**: Dense + BM25 + RRF fusion (Haystack components)
-- **Adaptive Routing**: Multi-source query routing
-- **Security**: Input/output guards, PII redaction
+---
 
-## Quick Start
+> **A note on what this is.** This is a public, high level view of a project I built for a customer. The system, the methodology, and the eval harness are real and runnable. The full customer corpus, the production traces, and the calibrated final judge numbers are not exposed here. That is why `knowledge_base/` is in `.gitignore`. I took permission to share the bare minimum needed to make my work credible, and nothing more.
+>
+> Where this version uses a smaller synthetic dataset, a dev-split number, or a single-row failure-mode experiment instead of the full customer result, I say so plainly rather than dressing it up. The numbers in this README are the ones I actually measured on this code with the inputs I had permission to share.
+
+---
+
+## Table of contents
+
+1. [Headline results](#headline-results)
+2. [Stack at a glance](#stack-at-a-glance)
+3. [What's built vs. what's planned](#whats-built-vs-whats-planned)
+4. [Quick start](#quick-start)
+5. [Project structure](#project-structure)
+6. Engineering decisions
+   - Index time
+     - [Chunking strategy](#chunking-strategy)
+     - [Embedding model](#embedding-model)
+     - [Vector database](#vector-database)
+   - Query time
+     - [Retrieval strategy](#retrieval-strategy)
+     - [Evaluation, the diagnostic framework](#evaluation-the-diagnostic-framework)
+   - Serving and operations
+     - [FastAPI streaming backend](#fastapi-streaming-backend)
+     - [Caching layers](#caching-layers)
+     - [Production architecture and cost at scale](#production-architecture-and-cost-at-scale)
+     - [Observability with Langfuse](#observability-with-langfuse)
+7. [What's next](#whats-next)
+8. [References](#references)
+
+---
+
+## Headline results
+
+The numbers below were all measured on this stack, not pulled from a blog. Each one links to the section that explains how it was produced and what it means.
+
+- **Streaming endpoint feels 2.6x faster than the blocking one.** `stream TTFT P50 = 1737ms` vs `sync total P50 = 4483ms` over 50 paired requests. The LLM did not get faster, the user just sees tokens earlier. ([details](#fastapi-streaming-backend))
+- **L1 exact-match cache cuts P50 by ~500x.** `sync P50: 3911ms → 7ms` on repeated questions. The tail barely moved, which is the honest takeaway. ([details](#l1-exact-match))
+- **L2 semantic cache cuts P50 by ~6.4x on rephrased questions.** `sync P50: 3911ms → 610ms` across 50 paraphrased queries. Tuned the cosine threshold to 0.85 after watching the Langfuse similarity distribution on real misses. ([details](#l2-semantic-match))
+- **Recall is the only one of the four standard RAG metrics that catches a broken retriever.** Faithfulness and Answer Relevancy both stayed at 1.00 while contextual recall went to 0.00. A system can score perfectly on three metrics and still be silently wrong. ([details](#evaluation-the-diagnostic-framework))
+- **Switching from a small local embedder to `text-embedding-3-small` fixed retrieval failures the small model could not solve.** The smaller model could not bridge "make money" and "earn income" in this corpus. Query expansion did not save it. The cost difference at this scale is a coffee per month. ([details](#embedding-model))
+- **At 1M queries/month, the all-in bill is around $400 to $600.** LLM input tokens dominate by an order of magnitude, not model choice. Cache hit rate is the second biggest lever. ([details](#production-architecture-and-cost-at-scale))
+
+---
+
+## Stack at a glance
+
+| Layer | Choice | Why |
+|---|---|---|
+| Framework | Haystack | Built-in indexing + retrieval components, swappable pieces, fewer custom adapters to write. |
+| Web layer | FastAPI + SSE | Async-first, native streaming, low ceremony. |
+| Vector store | Qdrant (managed) | Filtered HNSW for metadata-aware search, managed so I don't own ops. |
+| Cache | Redis Stack | Same box covers L1 GET and L2 vector KNN. One dependency, two cache types. |
+| Embeddings | OpenAI `text-embedding-3-small` (1536-D) | Large enough vocabulary to bridge user phrasing and corpus phrasing. |
+| Generation | OpenAI `gpt-4o-mini` | Cheap, good enough for this corpus. Eval is the gate for upgrading. |
+| Eval | DeepEval | Four-metric framework plus deliberate failure-mode experiments. |
+| Observability | Langfuse (drop-in OpenAI wrapper) | One-line integration, auto-captures cost, tokens, latency, errors. |
+
+---
+
+## What's built vs. what's planned
+
+Being honest about this is more useful than overclaiming. The chat path is intentionally minimal so latency and cache experiments aren't muddied by extra components.
+
+**Wired into the live request path (`/chat/sync`, `/chat/stream`):**
+- Dense retrieval against Qdrant (`text-embedding-3-small`, `top_k=5`)
+- L1 exact-match cache (Redis GET on hashed query text)
+- L2 semantic cache (Redis Stack KNN over query embeddings)
+- SSE streaming with a dedicated `ttft` event
+- Langfuse tracing on every request (spans for cache-L1, embed, cache-L2, retrieve, generation)
+
+**Scaffolded but not yet in the request path:**
+- CRAG (self-correcting RAG): file in `agents/`, not wired in
+- Adaptive multi-source query router: file in `agents/`, not wired in
+- Input/output guards and PII redaction: files in `security/`, not called from chat routes
+- Document grader, query decomposer, reranker: files in `services/` and `retrieval/`, used in offline scripts only
+
+**Planned next:**
+- Hybrid retrieval (BM25 + dense + RRF). See [Retrieval strategy](#retrieval-strategy).
+- Embedding cache to retire L1 cleanly. See [Caching layers](#caching-layers).
+- User-feedback scores attached to Langfuse trace IDs. See [Observability](#observability-with-langfuse).
+
+---
+
+## Quick start
 
 ```bash
-# Start infrastructure
+# Start infrastructure (Qdrant + Redis Stack)
 docker-compose up -d
 
-# Install dependencies
+# Install dependencies (uv)
 uv sync
 
-# Run API
+# Run the API
 uv run uvicorn app.main:app --reload
 ```
 
-## Project Structure
+Environment variables live in `.env.example`. The required keys are `OPENAI_API_KEY`, `QDRANT_*`, `REDIS_*`, and the three `LANGFUSE_*` keys.
+
+To index the knowledge base:
+
+```bash
+uv run python scripts/index_documents.py
+```
+
+To run the latency benchmark:
+
+```bash
+uv run python scripts/bench_latency.py --rows 0,1,2,3,4 --repeats 10
+```
+
+---
+
+## Project structure
 
 ```
 advanced-rag/
-├── app/              # FastAPI application
-├── routes/           # API endpoints
-├── services/         # Custom business logic (wraps Haystack)
-├── retrieval/        # Haystack retrieval pipelines
-├── agents/           # Agentic layer (CRAG, routing)
-├── prompts/          # Versioned prompts
-├── security/         # Guards & filters
-└── pipeline/         # Haystack indexing pipeline
+├── app/              FastAPI app: main.py, config, document_store wiring
+├── routes/           HTTP endpoints. The chat path lives in routes/chat.py
+├── services/         Pipeline glue and helpers (semantic cache lives here)
+├── retrieval/        Haystack retrieval pipelines and filter helpers
+├── pipeline/         Offline indexing pipeline and chunkers
+├── agents/           Agentic components (scaffolded, see "Built vs planned")
+├── prompts/          Versioned prompt templates
+├── security/         Guards and content filters (scaffolded)
+├── eval/             DeepEval configs and failure-mode experiments
+├── scripts/          Bench harness, indexing scripts, test scripts
+└── knowledge_base/   Source markdown corpus (~226 files)
 ```
 
-## Design Decisions
+The chat path is short by design. `routes/chat.py` is the file to read if you want to see the wired flow end to end.
 
-### Chunking Strategy
+---
+
+# Engineering decisions
+
+Each section below is one decision, structured as: what I chose, what I considered, why, what the numbers say, and what I'd revisit. They're ordered by where they sit in the request lifecycle.
+
+---
+
+## Chunking strategy
 
 **Decision:** Hybrid approach. Embed the whole document for short files, and split by H2 headers for longer ones.
 
@@ -76,14 +178,9 @@ This was answered by reading the corpus directly. Each H2 section is self-contai
 
 **Why this works for this corpus:** Each file is a single focused topic written with section boundaries. Splitting by those boundaries gives retrieval precision (a query about "who is MIA for" retrieves that section, not the whole doc). Boilerplate filtering removes noise before it reaches the vector store.
 
-**References:**
-- [RAG Chunking Strategies: The 2026 Benchmark Guide](https://blog.premai.io/rag-chunking-strategies-the-2026-benchmark-guide/)
-- Vectara / FloTorch 2026 benchmark (recursive 512t: 69%, semantic: 54%)
-- Firecrawl: chunking actively hurts retrieval on short, focused documents
-
 ---
 
-### Embedding Model
+## Embedding model
 
 **Decision:** `text-embedding-3-small` (OpenAI API, 1536 dimensions)
 
@@ -122,7 +219,7 @@ So at this corpus size, indexing is a coffee. Query embedding at 1M/month is als
 
 ---
 
-### Vector Database
+## Vector database
 
 **Decision:** Qdrant Cloud (managed).
 
@@ -143,7 +240,7 @@ So at this corpus size, indexing is a coffee. Query embedding at 1M/month is als
 
 **Cost surfaces, the ones that actually show up on the bill:**
 
-1. **Storage.** Grows with `(vectors × dimension × 4 bytes)` plus payload and HNSW index overhead. Rough rule: a 1536-D float32 vector is ~6KB raw, ~10–12KB after index overhead. At 1M vectors that's ~10GB; the current corpus sits comfortably below the smallest managed tier.
+1. **Storage.** Grows with `(vectors × dimension × 4 bytes)` plus payload and HNSW index overhead. Rough rule: a 1536-D float32 vector is ~6KB raw, ~10 to 12KB after index overhead. At 1M vectors that's ~10GB; the current corpus sits comfortably below the smallest managed tier.
 2. **Queries / reads.** Qdrant Cloud prices on cluster size (RAM/CPU), not per-query, so reads are effectively bundled into the cluster line. On Pinecone, per-query pricing is explicit and you watch it.
 3. **Writes / upserts.** Only matters if the corpus churns. This one doesn't.
 4. **Egress.** Cross-region reads are the silent killer on managed services. Put the cluster in the same region as the API.
@@ -162,7 +259,7 @@ So at this corpus size, indexing is a coffee. Query embedding at 1M/month is als
 
 ---
 
-### Retrieval Strategy
+## Retrieval strategy
 
 **Current:** Dense-only retrieval via Qdrant (`QdrantEmbeddingRetriever`, `top_k=5`)
 
@@ -177,7 +274,7 @@ The most specific chunk (`## 4. Who This Is For` from `what-is-mia.md`) ranks at
 
 ---
 
-### Evaluation, the Diagnostic Framework
+## Evaluation, the diagnostic framework
 
 **Decision:** Run the four standard RAG metrics (Faithfulness, Contextual Precision, Contextual Recall, Answer Relevancy) on a small golden set. Then deliberately break individual pipeline components and observe which metrics react. The point isn't the absolute scores. It's building the intuition for *which metric flags which failure mode*.
 
@@ -232,37 +329,7 @@ The only signal of generator degradation was a **0.88 Answer Relevancy** (vs 1.0
 
 ---
 
-### Production architecture and cost at scale
-
-**Latency budget (target: TTFT P90 < 2s).** A RAG response spends time across embed, search, optional rerank, generate, and network. LLM generation dominates (60 to 80% of total), which is why streaming is the single biggest UX win. It does not cut total time, it cuts perceived latency to the first token. Measured numbers on this stack are in the streaming-backend section below (`stream TTFT P50 = 1737ms`, `sync total P50 = 4483ms`, **2.6x perceived win**).
-
-**Cost drivers, ranked.** LLM calls dominate by an order of magnitude. Embedding refresh is small but easy to forget. Vector DB hosting is fixed cost. Rerankers (if hosted) become meaningful at volume.
-
-**Back-of-envelope cost at 1M queries/month on this stack** (`gpt-4o-mini` + `text-embedding-3-small`, `top_k=5`):
-
-| Component | Tokens per query | Tokens / month | Unit price | Monthly cost |
-|---|---|---|---|---|
-| Query embedding (`text-embedding-3-small`) | ~30 in | 30M | $0.020 / 1M | **$0.60** |
-| LLM input (instruction + 5 chunks + query) | ~1,500 in | 1.5B | $0.15 / 1M | **$225** |
-| LLM output (`gpt-4o-mini`) | ~250 out | 250M | $0.60 / 1M | **$150** |
-| | | | **Total** | **~$375 / month** |
-
-That works out to **~$0.000375 per query**. Pricing reference: https://developers.openai.com/api/docs/pricing
-
-**What this number is sensitive to.**
-- *Chunk size and `top_k`.* Doubling either roughly doubles LLM input cost. The dominant input line is retrieved context, not the user query or instruction.
-- *Output length.* A chatty 500-token answer doubles the output line ($150 to $300). Capping `max_tokens` is a direct cost lever.
-- *Model swap.* Moving the same workload to `gpt-4o` (full) is ~16x input and ~25x output, so the bill jumps from ~$375 to **~$7,300/month**. Stay on `mini` until eval shows it's the bottleneck.
-- *Cache hit rate.* A 50% semantic-cache hit rate roughly halves the LLM lines. At 1M queries, that's ~$190 saved per month (semantic cache is planned, not yet wired).
-- *Reranker.* Not currently in the pipeline. If added (e.g. Cohere Rerank at ~$2/1M docs), 5M reranked docs/month adds ~$10. Negligible vs the LLM bill.
-
-**What's not in the table.** Vector DB hosting (Qdrant self-hosted: VM cost only; managed: ~$100 to $600/month at this scale), Langfuse (free tier likely sufficient at 1M traces with 10% sampling), Redis (small instance ~$15/month). Add a flat ~$50 to $200 infra line on top.
-
-**Takeaway.** At 1M queries/month, this stack is a **~$400 to $600/month all-in** workload. The single biggest cost lever is LLM input tokens, which is controlled by chunk count and chunk size, not model choice. Cache is the second lever once hit rate gets measured.
-
----
-
-### FastAPI streaming backend
+## FastAPI streaming backend
 
 **Goal:** make the user-perceived latency of the chat endpoint a measured number, not a vibe. Ship two endpoints, bench both, prove the streaming win.
 
@@ -342,15 +409,9 @@ The first pass at N=15 (3 repeats) had P50s within 10% of these, but P95 for str
 1. **Investigate retrieval variance.** Read `embed_ms` vs `qdrant_ms` off the Langfuse trace (the `retrieve` span has an `OpenAI-embedding` child). If embedding dominates, batching/caching common queries gets a bigger TTFT win than streaming did.
 2. **Layer concurrency** (`--concurrency N`). TTFT under load is where streaming's perceptual win matters most. Queued users still see *something* while waiting.
 
-**References:**
-- [BentoML, LLM inference metrics](https://bentoml.com/llm/inference-optimization/llm-inference-metrics)
-- [NVIDIA NIM benchmarking metrics](https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html)
-- [Artificial Analysis, performance benchmarking methodology](https://artificialanalysis.ai/methodology/performance-benchmarking)
-- [Cloud Portable Tech, RAG benchmark SSE contract](https://www.cloudportabletech.com)
-
 ---
 
-### Caching layers
+## Caching layers
 
 There are three different cache layers worth knowing about. Two are built (L1, L2). One is planned (embedding cache). They sit at different stages of a request and they save different costs.
 
@@ -386,7 +447,7 @@ L2 lookup (KNN over stored embeddings in Redis Stack)
 Qdrant retrieval → LLM → store answer in L1 and L2
 ```
 
-#### L1 (exact match)
+### L1 (exact match)
 
 **The problem.** After the streaming work, P50 TTFT was around 1.4 seconds and P95 was about 1.9 seconds. The biggest single cost inside that was the OpenAI embedding call, which by itself can take a full second on a bad day. Calling OpenAI every single time a user asks the same question is wasteful. If two people ask "how do I get paid" five minutes apart, the answer is the same, and we already paid to compute it once.
 
@@ -454,7 +515,7 @@ CACHE_ENABLED=false uv run uvicorn app.main:app --port 8000
 
 **Bench reproducibility note.** The benchmark used to run sync and stream interleaved per question, which meant the second endpoint always saw a warm cache populated by the first. That made the second endpoint's numbers look unrealistically good. The bench now flushes Redis between the sync phase and the stream phase, so each phase sees its own cold-path misses. Pass `--no-flush-between-phases` to get the old behavior back if you want to simulate a session that hits both endpoints.
 
-#### L2 (semantic match)
+### L2 (semantic match)
 
 **What it stores.** The full answer, keyed by the *embedding* of the original question.
 
@@ -511,7 +572,7 @@ L2_THRESHOLD=0.85 uv run uvicorn app.main:app --port 8000
 uv run python scripts/bench_latency.py --rows 0,1,2,3,4 --repeats 10 --paraphrase-mode
 ```
 
-#### Embedding cache (planned, not built)
+### Embedding cache (planned, not built)
 
 **What it stores.** Just the embedding vector, keyed by a hash of the question text.
 
@@ -531,7 +592,7 @@ Redis entry:
 
 **The relationship with L1.** Once embedding cache exists, L1 becomes redundant. The reason L1 exists today is that without an embedding cache, every L1 miss pays the embedding tax. With both an embedding cache and L2, the flow for an exact repeat would be: embed lookup (~5ms) → L2 lookup (~5ms) → return. ~10ms total, basically as fast as L1's 5ms, and one fewer cache to maintain.
 
-#### Why the three are not interchangeable
+### Why the three are not interchangeable
 
 They cache different things at different stages. The shortest way to say it:
 
@@ -541,7 +602,7 @@ They cache different things at different stages. The shortest way to say it:
 
 L1 and the embedding cache both key on exact text, but they return different things (final answer vs intermediate vector). L2 and L1 both return answers, but L2 is keyed by meaning (the embedding) while L1 is keyed by exact text.
 
-#### The honest tradeoffs
+### The honest tradeoffs
 
 - **L1 alone** is fast on exact repeats, useless on rephrasings.
 - **L2 alone** catches rephrasings, but every request pays the embedding cost upfront (no way to skip it, you need the embedding to do the L2 lookup).
@@ -552,7 +613,37 @@ The migration plan is: build L1 first (cheap, immediate win), build L2 next (rea
 
 ---
 
-### Observability with Langfuse
+## Production architecture and cost at scale
+
+**Latency budget (target: TTFT P90 < 2s).** A RAG response spends time across embed, search, optional rerank, generate, and network. LLM generation dominates (60 to 80% of total), which is why streaming is the single biggest UX win. It does not cut total time, it cuts perceived latency to the first token. Measured numbers on this stack are in the streaming-backend section above (`stream TTFT P50 = 1737ms`, `sync total P50 = 4483ms`, **2.6x perceived win**).
+
+**Cost drivers, ranked.** LLM calls dominate by an order of magnitude. Embedding refresh is small but easy to forget. Vector DB hosting is fixed cost. Rerankers (if hosted) become meaningful at volume.
+
+**Back-of-envelope cost at 1M queries/month on this stack** (`gpt-4o-mini` + `text-embedding-3-small`, `top_k=5`):
+
+| Component | Tokens per query | Tokens / month | Unit price | Monthly cost |
+|---|---|---|---|---|
+| Query embedding (`text-embedding-3-small`) | ~30 in | 30M | $0.020 / 1M | **$0.60** |
+| LLM input (instruction + 5 chunks + query) | ~1,500 in | 1.5B | $0.15 / 1M | **$225** |
+| LLM output (`gpt-4o-mini`) | ~250 out | 250M | $0.60 / 1M | **$150** |
+| | | | **Total** | **~$375 / month** |
+
+That works out to **~$0.000375 per query**. Pricing reference: https://developers.openai.com/api/docs/pricing
+
+**What this number is sensitive to.**
+- *Chunk size and `top_k`.* Doubling either roughly doubles LLM input cost. The dominant input line is retrieved context, not the user query or instruction.
+- *Output length.* A chatty 500-token answer doubles the output line ($150 to $300). Capping `max_tokens` is a direct cost lever.
+- *Model swap.* Moving the same workload to `gpt-4o` (full) is ~16x input and ~25x output, so the bill jumps from ~$375 to **~$7,300/month**. Stay on `mini` until eval shows it's the bottleneck.
+- *Cache hit rate.* A 50% semantic-cache hit rate roughly halves the LLM lines. At 1M queries, that's ~$190 saved per month.
+- *Reranker.* Not currently in the pipeline. If added (e.g. Cohere Rerank at ~$2/1M docs), 5M reranked docs/month adds ~$10. Negligible vs the LLM bill.
+
+**What's not in the table.** Vector DB hosting (Qdrant self-hosted: VM cost only; managed: ~$100 to $600/month at this scale), Langfuse (free tier likely sufficient at 1M traces with 10% sampling), Redis (small instance ~$15/month). Add a flat ~$50 to $200 infra line on top.
+
+**Takeaway.** At 1M queries/month, this stack is a **~$400 to $600/month all-in** workload. The single biggest cost lever is LLM input tokens, which is controlled by chunk count and chunk size, not model choice. Cache is the second lever once hit rate gets measured.
+
+---
+
+## Observability with Langfuse
 
 **Why this is a different tool than the bench script.** The bench (`scripts/bench_latency.py`) is a *pre-deploy regression gate* with fixed inputs that runs on demand. Langfuse is for *online traffic*, where every real request emits a trace and dashboards aggregate over real users. Both coexist. They answer different questions.
 
@@ -603,6 +694,39 @@ chat-sync | chat-stream                  ← parent span (input = user query, ou
 - **Sampling.** At low traffic, sample 100%. Once the project sees real volume, set `LANGFUSE_SAMPLE_RATE=0.1` to keep the cost/storage bill reasonable while still getting representative percentiles.
 - **PII masking.** Knowledge base is non-sensitive, so query/answer logging is safe. If this ever ingests user-provided documents, revisit.
 
-**References:**
+---
+
+## What's next
+
+In rough priority order, what I'd build next if this kept being my main project:
+
+1. **Fix the retrieval tail.** Per-request retrieval ranges from 440ms to 4132ms for the same query, dominated by the OpenAI embedding call. An embedding cache is the cleanest fix and would also let me retire L1.
+2. **Wire hybrid retrieval (BM25 + dense + RRF).** The Haystack pieces are there. BM25 catches the keyword-heavy edge cases dense retrieval misses, and RRF fuses them without tuning weights.
+3. **Add concurrent load to the bench.** TTFT under load is where streaming's perceptual win matters most. Right now I only measure single-request latency.
+4. **Return trace IDs to the client and add a `/feedback` endpoint.** Langfuse needs feedback scores to close the eval loop on real users.
+5. **Wire CRAG, the router, and guards into the live request path.** The scaffolding exists; they need to be plugged in and benched before being claimed as features.
+
+---
+
+## References
+
+**Chunking and embeddings**
+- [RAG Chunking Strategies: The 2026 Benchmark Guide](https://blog.premai.io/rag-chunking-strategies-the-2026-benchmark-guide/)
+- Vectara / FloTorch 2026 benchmark (recursive 512t: 69%, semantic: 54%)
+- Firecrawl: chunking actively hurts retrieval on short, focused documents
+- [OpenAI `text-embedding-3-small` pricing](https://developers.openai.com/api/docs/models/text-embedding-3-small)
+
+**Streaming and latency**
+- [BentoML, LLM inference metrics](https://bentoml.com/llm/inference-optimization/llm-inference-metrics)
+- [NVIDIA NIM benchmarking metrics](https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html)
+- [Artificial Analysis, performance benchmarking methodology](https://artificialanalysis.ai/methodology/performance-benchmarking)
+- [Cloud Portable Tech, RAG benchmark SSE contract](https://www.cloudportabletech.com)
+
+**Cost and observability**
+- [OpenAI API pricing](https://developers.openai.com/api/docs/pricing)
 - [Langfuse, OpenAI Python integration](https://langfuse.com/integrations/model-providers/openai-py)
 - [Langfuse skill repo](https://github.com/langfuse/skills) (installed at `.claude/skills/langfuse/`)
+
+---
+
+Built by Mohsin Sheikhani. If anything here is interesting and you'd like to talk, [linkedin.com/in/mohsin-sheikhani](https://www.linkedin.com/in/mohsin-sheikhani/).
