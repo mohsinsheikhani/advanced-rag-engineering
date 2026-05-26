@@ -12,6 +12,7 @@ from langfuse import get_client
 from app.document_store import get_document_store
 from app.config import settings
 from routes.chat import router as chat_router
+from services.semantic_cache import get_cache
 
 # Global state
 app_state = {}
@@ -21,7 +22,8 @@ async def lifespan(app: FastAPI):
     # Startup: Initialize Haystack document store and Redis
     app_state["document_store"] = get_document_store()
     app_state["redis"] = await redis.from_url(f"redis://{settings.redis_host}:{settings.redis_port}")
-    
+    await get_cache().ensure_index()
+
     yield
 
     # Shutdown: flush Langfuse traces, then cleanup resources.

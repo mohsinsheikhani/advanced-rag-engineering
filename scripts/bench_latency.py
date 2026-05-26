@@ -30,13 +30,43 @@ import httpx
 
 REPO_ROOT = Path(__file__).parent.parent
 TESTSET = REPO_ROOT / "eval" / "datasets" / "synthetic_testset_raw.csv"
+PARAPHRASES = REPO_ROOT / "eval" / "datasets" / "bench_paraphrases.json"
 RESULTS = Path(__file__).parent / "bench_results.csv"
+
+
+async def flush_redis(host: str, port: int) -> None:
+    """FLUSHALL between phases so each endpoint sees its own cold-path misses.
+    Without this, whichever phase runs second gets 100% cache hits — the cache
+    populated by the first phase. That makes the second phase's tail look fake.
+
+    FLUSHALL also drops the L2 vector index (it lives in Redis), so we recreate
+    it here. Otherwise the second phase would silently L2-miss on everything.
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    from services.semantic_cache import get_cache  # noqa: E402
+    import redis.asyncio as redis
+    client = redis.Redis(host=host, port=port)
+    try:
+        await client.flushall()
+    finally:
+        await client.aclose()
+    await get_cache().ensure_index()
 
 
 def load_queries(rows: list[int]) -> list[str]:
     with open(TESTSET) as f:
         all_rows = list(csv.DictReader(f))
     return [all_rows[i]["user_input"] for i in rows]
+
+
+def load_paraphrase_groups(rows: list[int]) -> list[list[str]]:
+    """Each group = [original, paraphrase_1, ..., paraphrase_9] for one base query.
+    First call per group is L1+L2 cold-miss (full pipeline + populate L2).
+    Subsequent calls are unique text (L1 miss) but semantically close (L2 hit, ideally).
+    """
+    with open(PARAPHRASES) as f:
+        data = json.load(f)
+    return [data[str(i)] for i in rows]
 
 
 async def bench_sync(client: httpx.AsyncClient, query: str) -> dict:
@@ -179,22 +209,60 @@ async def main() -> None:
                     help="repeats per query per endpoint (after warmup)")
     ap.add_argument("--warmup", type=int, default=2,
                     help="warmup requests per endpoint (discarded)")
+    ap.add_argument("--flush-between-phases", action="store_true", default=True,
+                    help="FLUSHALL Redis between sync and stream phases so "
+                         "each endpoint sees its own cold-path misses")
+    ap.add_argument("--no-flush-between-phases", dest="flush_between_phases",
+                    action="store_false")
+    ap.add_argument("--redis-host", default="localhost")
+    ap.add_argument("--redis-port", type=int, default=6379)
+    ap.add_argument("--paraphrase-mode", action="store_true",
+                    help="Send unique paraphrases per base query instead of "
+                         "repeating identical text. Forces L1 misses so L2 "
+                         "is the only thing that can short-circuit. Uses "
+                         "eval/datasets/bench_paraphrases.json.")
     args = ap.parse_args()
 
     row_indices = [int(x) for x in args.rows.split(",")]
-    queries = load_queries(row_indices)
+
+    # Build the query plan: list of lists, one per base query.
+    # Repeat mode: [[q0, q0, ...], [q1, q1, ...], ...]   ← all identical inside a group
+    # Paraphrase mode: [[orig0, para0_1, ...], [orig1, para1_1, ...], ...]   ← unique inside a group
+    if args.paraphrase_mode:
+        groups = load_paraphrase_groups(row_indices)
+        groups = [g[: args.repeats] for g in groups]
+        warmup_q = groups[0][0]
+    else:
+        queries = load_queries(row_indices)
+        groups = [[q] * args.repeats for q in queries]
+        warmup_q = queries[0]
 
     async with httpx.AsyncClient(base_url=args.base_url) as client:
         # Warmup — discarded. Cold imports, connection pool, OpenAI route.
-        warmup_q = queries[0]
         for _ in range(args.warmup):
             await bench_sync(client, warmup_q)
             await bench_stream(client, warmup_q)
 
+        # Phase-separated: sync first, then flush, then stream. Interleaving
+        # the two endpoints lets the first one warm the cache for the second,
+        # which makes the second phase's P95 a lie.
+        if args.flush_between_phases:
+            await flush_redis(args.redis_host, args.redis_port)
+
         samples: list[dict] = []
-        for q in queries:
-            for _ in range(args.repeats):
+        print("sync: ", end="", flush=True)
+        for group in groups:
+            for q in group:
                 samples.append(await bench_sync(client, q))
+                print(".", end="", flush=True)
+        print()
+
+        if args.flush_between_phases:
+            await flush_redis(args.redis_host, args.redis_port)
+
+        print("stream: ", end="", flush=True)
+        for group in groups:
+            for q in group:
                 samples.append(await bench_stream(client, q))
                 print(".", end="", flush=True)
         print()

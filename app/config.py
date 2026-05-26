@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # Redis Cache
     redis_host: str = "localhost"
     redis_port: int = 6379
+    cache_enabled: bool = True
+    l2_enabled: bool = True
+    l2_threshold: float = 0.92  # cosine similarity; raise if you see wrong hits
     
     class Config:
         env_file = ".env"

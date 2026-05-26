@@ -1,0 +1,15 @@
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+.git
+.gitignore
+.env.local
+.pytest_cache
+.ruff_cache
+.mypy_cache
+node_modules
+*.log
+knowledge_base
+eval/results
+scripts/bench_results

@@ -350,6 +350,208 @@ The first pass at N=15 (3 repeats) had P50s within 10% of these, but P95 for str
 
 ---
 
+### Caching layers
+
+There are three different cache layers worth knowing about. Two are built (L1, L2). One is planned (embedding cache). They sit at different stages of a request and they save different costs.
+
+**Quick comparison.**
+
+| Layer | Keyed by | Returns | Saves | Catches |
+|---|---|---|---|---|
+| **L1** | exact text hash | full answer | embed + retrieve + LLM | exact repeats |
+| **Embedding cache** | exact text hash | embedding vector | OpenAI embedding call | exact repeats |
+| **L2** | embedding vector | full answer | retrieve + LLM | rephrasings |
+
+**Where each one sits in the request.**
+
+```
+question "how do I get paid"
+   │
+   ▼
+L1 lookup (Redis GET on sha256 of normalized text)
+   ├─ hit  → return cached answer. ~5ms. Done.
+   └─ miss → keep going
+   │
+   ▼
+Embedding cache lookup (Redis GET on sha256 of text)   ← planned, not built
+   ├─ hit  → use the cached vector. No OpenAI call.
+   └─ miss → call OpenAI to embed (~200 to 1200ms), store the vector for next time
+   │
+   ▼
+L2 lookup (KNN over stored embeddings in Redis Stack)
+   ├─ hit  → return cached answer (if similarity ≥ 0.92). ~5ms.
+   └─ miss → keep going
+   │
+   ▼
+Qdrant retrieval → LLM → store answer in L1 and L2
+```
+
+#### L1 (exact match)
+
+**The problem.** After the streaming work, P50 TTFT was around 1.4 seconds and P95 was about 1.9 seconds. The biggest single cost inside that was the OpenAI embedding call, which by itself can take a full second on a bad day. Calling OpenAI every single time a user asks the same question is wasteful. If two people ask "how do I get paid" five minutes apart, the answer is the same, and we already paid to compute it once.
+
+**What L1 does.** Before doing any work, we check Redis to see if we already answered this exact question recently. The cache key is just a hash of the cleaned-up question (lowercased, extra spaces removed). If it's there, we return the stored answer in a few milliseconds. If it's not, we do the normal pipeline and save the answer for next time. The stored value lives for one hour and then expires on its own.
+
+This is the simplest kind of cache. Same question in, same answer out. It does not understand that "how do I get paid" and "how do I receive payment" mean the same thing. That's what L2 handles.
+
+**Where it sits in the request flow.**
+
+```
+question → check Redis (a few ms)
+            ├─ hit  → return cached answer. Done.
+            └─ miss → embed → search Qdrant → call LLM → save to Redis → return.
+```
+
+**What it stores.**
+
+```
+Redis entry:
+  key:   cache:l1:<sha256("how do i get paid")>
+  value: {"answer": "...", "sources": [...]}
+```
+
+**What it saves.** Everything below it in the stack. On a hit you pay one Redis GET, around 5ms. Skips OpenAI embed + Qdrant + OpenAI completion.
+
+**What it catches.** Exact text repeats. Page refresh, retry button, copy-paste, the same FAQ asked twice.
+
+**Why it's worth having.** The cost saved is huge, and the implementation is tiny (~10 lines, no schema, no index). Even at modest exact-repeat rates the cost-benefit is overwhelming.
+
+**The numbers, cache off vs cache on** (50 calls each, 5 unique questions repeated 10 times):
+
+```
+                       Cache OFF        Cache ON         What changed
+                       ----------       ----------       --------------------
+sync   P50               3911 ms             7 ms        ~500x faster
+sync   P95               6542 ms          4342 ms        ~33% faster
+stream TTFT P50          1426 ms             8 ms        ~180x faster
+stream TTFT P95          1917 ms          1418 ms        ~25% faster
+```
+
+**Reading this without jargon.** P50 is the typical experience. P95 is the worst experience that 1 in 20 users will see. The cache made the typical experience way better, but the worst-case only got a little better. Why?
+
+Because 5 out of those 50 calls are "first time we've ever seen this question". The cache can't help those. They still pay the full ~4 second cost. P95 lands right on top of those slow ones, so P95 stays slow.
+
+If you think about it from a user's seat: the first person to ask "how do I get paid" today waits 4 seconds. Everyone else who asks the same thing for the next hour waits 7 milliseconds. That's the win L1 buys.
+
+**Where L1 helps and where it doesn't.**
+
+| Situation | Does L1 help? |
+|---|---|
+| User asks the same question multiple times | Yes, huge. |
+| Two users ask the exact same question | Yes. |
+| User asks "how do I get paid" and later "how do I receive payment" | No. Different text, cache misses. L2 fixes this. |
+| Brand new question nobody has asked before | No. First request always pays full cost. |
+
+**The honest takeaway.** L1 moves the median latency a lot. It barely moves the tail. To move the tail you have to either make the cache catch near-duplicate questions too (that's L2), or make the slow path itself faster (cache the embedding call separately, use a smaller model, etc).
+
+**What came next.** L2 semantic cache. Same idea, but instead of matching on exact text, match on meaning using the question's embedding. Starting threshold 0.92 cosine similarity (raise it if we start seeing wrong cached answers come back). That's where the real production hit rate comes from, because in real traffic almost nobody asks the same exact words twice.
+
+**How to turn it off.** Set `CACHE_ENABLED=false` before starting the API. Useful for benchmarking the cold path or debugging.
+
+```bash
+CACHE_ENABLED=false uv run uvicorn app.main:app --port 8000
+```
+
+**Bench reproducibility note.** The benchmark used to run sync and stream interleaved per question, which meant the second endpoint always saw a warm cache populated by the first. That made the second endpoint's numbers look unrealistically good. The bench now flushes Redis between the sync phase and the stream phase, so each phase sees its own cold-path misses. Pass `--no-flush-between-phases` to get the old behavior back if you want to simulate a session that hits both endpoints.
+
+#### L2 (semantic match)
+
+**What it stores.** The full answer, keyed by the *embedding* of the original question.
+
+```
+Redis entry (Redis Stack HASH):
+  key:   cache:l2:<random-uuid>
+  value: {
+    embedding: <1536 float32 bytes>   ← this is the actual lookup key
+    answer:    "..."
+    sources:   [...]
+    query:     "how do I get paid"     ← original text, kept for debugging
+  }
+```
+
+A Redis Stack vector index (`cache:l2:idx`) sits on top of the `embedding` field. The UUID in the Redis key is just storage plumbing.
+
+**What it does.** Embeds the incoming question, then runs a K-nearest-neighbor search over the stored embeddings. If the closest stored entry is within the similarity threshold (currently 0.92 cosine similarity), return that entry's answer.
+
+**What it saves.** Retrieval (Qdrant) + LLM call. Still pays the embedding cost because you need the embedding to do the lookup.
+
+**What it catches.** Rephrasings. "how do I get paid", "how can I receive payment", "what's the payment process" should all match the same entry if their embeddings are close enough.
+
+**The threshold knob.** Currently 0.92. Lower means more hits but more risk of returning a wrong cached answer for a query that's only superficially similar. Higher means safer but you miss more rephrasings. Watch Langfuse `cache-l2.output.similarity` on real traffic to tune it. For RAG (where a wrong cached answer is worse than a slow correct one) something in the 0.92 to 0.97 range is normal.
+
+**Why we built it.** L1 only helps on exact repeats, which in real traffic is a small fraction. Most users phrase the same question slightly differently each time. L2 is what actually lifts the production hit rate from "small" to "30 to 70%".
+
+**The numbers, measured on rephrased queries.** The original L1 bench can't show L2 doing anything, because it asks the exact same query 10 times in a row. L1 catches all of those before L2 ever gets a turn. So I added a second bench mode (`--paraphrase-mode`) that sends 1 original plus 9 hand-written rephrasings per base query, 50 unique queries per endpoint with no two identical. That forces L1 to miss every single time, which is exactly what we need to see what L2 is actually doing. The paraphrases live in `eval/datasets/bench_paraphrases.json` if you want to read or change them.
+
+```
+                       Cache OFF        L1+L2 on (paraphrases)    What changed
+                       ----------       ----------------------    --------------------
+sync   P50               3911 ms             610 ms               ~6.4x faster
+sync   P95               6542 ms            4675 ms               ~30% faster
+stream TTFT P50          1426 ms             597 ms               ~2.4x faster
+stream TTFT P95          1917 ms            1881 ms               basically unchanged
+```
+
+**Why an L2 hit costs ~600ms instead of a few.** When L2 hits, we don't have to call the LLM and we don't have to hit Qdrant. But we still have to embed the incoming question, because the embedding is the lookup key. That OpenAI embedding call by itself is around 500ms. Add the Redis vector search on top and you land near 600ms. So 600ms is the floor for an L2-only setup. Getting under that requires caching the embedding too, which is the embedding cache work mentioned below.
+
+**Why P95 barely moved.** Two things are happening. The first paraphrase in each group has nothing to match against, because L2 is empty for that topic, so it pays full cold cost (around 4 seconds). And then one or two of the looser paraphrases per group land just below the similarity threshold and also pay the full cost. Out of 50 calls, you only need a few cold ones to land on top of the P95 bucket. L2 moves the median a lot. It does not move the tail at this hit rate. To move the tail you either need a higher hit rate (lower threshold, more seed coverage) or you need the cold path itself to be faster.
+
+**Why sync and stream now look basically the same.** When L2 hits, there's no LLM generation to stream. The answer is already sitting in Redis. So "time to first token" and "time to full answer" collapse to the same number, which is whatever embed+lookup cost. Streaming only buys you something when there's actually a generation happening behind it.
+
+**How I picked the threshold.** Started at 0.92, which is the safe default for cached RAG, the kind of default you pick when you'd rather miss than serve a wrong answer. At 0.92 the bench logged zero L2 hits. Pulled up the Langfuse traces and looked at the `cache-l2.output.top_similarity` field on each miss. The legitimate paraphrases were landing at 0.86, 0.89, 0.91, all just under the line. A cross-topic comparison (one base query checked against a different topic's stored entries) landed at 0.34, which is comfortably far away. So 0.85 catches the real paraphrase cluster and still has plenty of room above the cross-topic floor. On real traffic the same loop applies: log similarities for a week or two, look at the distribution, set the threshold one notch above whatever cluster you don't want to match into.
+
+**To reproduce.**
+
+```bash
+# 1. Restart Redis and the API so the L2 index is fresh
+docker compose restart redis
+L2_THRESHOLD=0.85 uv run uvicorn app.main:app --port 8000
+
+# 2. Run the paraphrase-mode bench
+uv run python scripts/bench_latency.py --rows 0,1,2,3,4 --repeats 10 --paraphrase-mode
+```
+
+#### Embedding cache (planned, not built)
+
+**What it stores.** Just the embedding vector, keyed by a hash of the question text.
+
+```
+Redis entry:
+  key:   cache:embed:<sha256("how do i get paid")>
+  value: <1536 float32 bytes>      ← just the vector
+```
+
+**What it does.** Hashes the incoming question. If we've embedded this exact text before, return the stored vector instead of calling OpenAI. No answer is involved at all, only the vector.
+
+**What it saves.** The OpenAI embedding API call (~200 to 1200ms depending on the day). This is currently the slowest single step in the cold path of this system, so it's a big lever.
+
+**What it catches.** Exact text repeats. Same vocabulary as L1.
+
+**Why it would be added.** Right now, every L1 miss pays the embedding cost even if we've embedded that exact text minutes ago. Embedding cache makes embed-on-repeat nearly free.
+
+**The relationship with L1.** Once embedding cache exists, L1 becomes redundant. The reason L1 exists today is that without an embedding cache, every L1 miss pays the embedding tax. With both an embedding cache and L2, the flow for an exact repeat would be: embed lookup (~5ms) → L2 lookup (~5ms) → return. ~10ms total, basically as fast as L1's 5ms, and one fewer cache to maintain.
+
+#### Why the three are not interchangeable
+
+They cache different things at different stages. The shortest way to say it:
+
+- **L1** = "I've seen this exact question. Here's the answer I gave."
+- **Embedding cache** = "I've embedded this exact text. Here's the vector."
+- **L2** = "I've answered something very similar. Here's that answer."
+
+L1 and the embedding cache both key on exact text, but they return different things (final answer vs intermediate vector). L2 and L1 both return answers, but L2 is keyed by meaning (the embedding) while L1 is keyed by exact text.
+
+#### The honest tradeoffs
+
+- **L1 alone** is fast on exact repeats, useless on rephrasings.
+- **L2 alone** catches rephrasings, but every request pays the embedding cost upfront (no way to skip it, you need the embedding to do the L2 lookup).
+- **L1 + L2** (current state) covers both, but exact repeats still benefit from L1's speed because L2 alone would pay the embedding cost on them.
+- **Embedding cache + L2** (future state) is the cleanest design: one place to cache vectors, one place to cache answers, L1 becomes redundant.
+
+The migration plan is: build L1 first (cheap, immediate win), build L2 next (real production hit rate), then add embedding cache and retire L1.
+
+---
+
 ### Observability with Langfuse
 
 **Why this is a different tool than the bench script.** The bench (`scripts/bench_latency.py`) is a *pre-deploy regression gate* with fixed inputs that runs on demand. Langfuse is for *online traffic*, where every real request emits a trace and dashboards aggregate over real users. Both coexist. They answer different questions.
